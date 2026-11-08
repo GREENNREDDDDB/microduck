@@ -192,6 +192,51 @@ if __name__ == "__main__":
 uv run --with pytest pytest tests/
 ```
 
+### 3.5 运行时接入点：`FallPredictor → LimpFall` 这条链
+
+这是**决定你策略以什么形式接进 robotd 的地方**。先把现状讲清楚，再讲你动哪里。
+
+`robotd` 对摔倒的**唯一**反应叫 `limp_fall`（[main.rs](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/robotd/src/main.rs#L170-L241)），它是在**摔倒过程中**跑的，不是"摔完再判定"的兜底。三层结构，各司其职：
+
+| 层 | 代码 | 判据 | 作用 |
+|---|---|---|---|
+| 位置式判定 | [`Safety::observe`](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/duck-control/src/safety.rs) → `fallen` | 投影重力 z > `fall_gravity_z=-0.5` 持续 `fall_debounce_ms=200` | **只被跟踪和发布，不 gate 任何东西**（等它 latch，鸭子已经在地上了） |
+| 速率式预测 | [`FallPredictor::observe`](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/duck-control/src/fall.rs#L136-L163) → 边沿 `true` | 陀螺推 `ġz = −(ωx·gy − ωy·gx)`，外推 `lookahead=300ms` 后越过阈值，三条件同时满足 + 去抖 | **这才是 limp-fall 的触发器** |
+| 动作状态机 | [`LimpFall`](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/robotd/src/main.rs#L177-L241) | `Idle → Limp → Posing → 交还` | 降增益 / 软化 / 复位位姿 |
+
+`FallPredictor` 的三个必要条件（[fall.rs L30-L39](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/duck-control/src/fall.rs#L30-L39)）：已越过 `tilt_z`（≈26°，走路够不到）**且**仍在往下倒（`ġz>0`）**且**外推后越过 `predicted_z`；再 `debounce=60ms`（50 Hz 三拍）。而且**只有站姿武装 `arm=200ms` 之后才会响**——这是为修一个真机死循环（前扑后趴在 58° 慢慢下滑被反复判成"又在摔"，limp→pose→limp，见 [fall.rs L41-L49](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/duck-control/src/fall.rs#L41-L49) 与测试 `a_robot_that_has_not_stood_never_fires`）。
+
+`LimpFall` 三段：
+
+- **`Limp`**：增益降到 `gain_limp=50`，关节被命令"停在原地"。注释写明为什么不是切力矩——切了会让**头砸到地上**，还丢掉下一阶段要 ramp 的位姿（[main.rs L180-L182](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/robotd/src/main.rs#L180-L182)）。
+- **落地判定读陀螺**（不是计时）：`limp_fall_still_rate=1.0` rad/s 以下并保持 `limp_fall_still_ms=200`；硬上限 `limp_fall_max_ms=1500`（被捧在手里时不能永远软着）。
+- **`Posing`**：从落地位姿线性 ramp 回 `DEFAULT_POSITION`，`limp_fall_pose_ms=600`，增益 `limp_fall_pose_gain=160`（关节要在地面上划，故比 limp 高、比行走低）。之后交还站立策略。
+
+全部参数在 `[safety]` 段（定义与文档见 [robotd-params/src/lib.rs L2436-L2496](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/robotd-params/src/lib.rs#L2436-L2496)，默认值在 L2540-L2549）：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `safety.limp_fall` | `true` | 总开关 |
+| `safety.gain_limp` | `50` | limp 阶段增益 |
+| `safety.limp_fall_tilt_z` | `-0.90` | 武装/触发的倾斜门槛（≈26°） |
+| `safety.limp_fall_predict_z` | `-0.5` | 外推目标（默认等于 `fall_gravity_z`） |
+| `safety.limp_fall_lookahead_ms` | `300` | 外推窗口 |
+| `safety.limp_fall_debounce_ms` | `60` | 触发去抖 |
+| `safety.limp_fall_arm_ms` | `200` | 站姿武装时长 |
+| `safety.limp_fall_still_rate` | `1.0` | 判落地角速率（rad/s） |
+| `safety.limp_fall_still_ms` | `200` | 判落地去抖 |
+| `safety.limp_fall_max_ms` | `1500` | limp 硬上限 |
+| `safety.limp_fall_pose_ms` | `600` | 复位位姿 ramp 时长 |
+| `safety.limp_fall_pose_gain` | `160` | 复位位姿增益 |
+
+**你动哪里（两条路线）：**
+
+- **路线 A —— 零 Rust 改动（先走这条）**：受身作为 **episodic 策略**经 `robotctl policy add ukemi <repo> --kind episodic` 装载、由命令槽触发（与 §4.6 / §5.1 是同一串命令）。
+  ⚠️ **必须知道的坑**：[control.rs L225-L228](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/robotd/src/control.rs#L225-L228) 写明——**运行中的 skill 会关掉摔倒反射**，因为 gate 住 `FallPredictor` 的正是 `busy()`，而任何活跃 skill 都让 `busy()` 为真。含义有两面：好的一面是你的策略执行期间不会被 `limp_fall` 抢方向盘；坏的一面是这段时间**没有** `limp_fall` 兜底，所以"受身没成功"必须由你的策略自己兜住。
+- **路线 B —— 改 Rust（运行时级）**：在 `FallPredictor` 触发点把"降增益 + limp"替换成"切到受身策略"，即改 [`LimpFall`](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/robotd/src/main.rs#L177-L241) 与 main.rs 的应答逻辑，再 `scripts/dev-push.sh`（§5.2）。这条路让受身成为**默认反射**（不必客户端显式 `robot do`），代价是改 Rust 并走更新链。
+
+**为什么这条链是你的核心资产**：它已经把"提前约 0.3 s 发现正在摔"这个最难的一半做完了，且其设计目标（**别让头砸地**，[main.rs L180-L182](file:///d:/4_DOCUMENTS/0_Learning/3_Github_Project/microduck/robotd/src/main.rs#L180-L182)）和 DCPI 同向。你要补的是"发现之后做什么"——现在是"软瘫着地"，你要升级成"受身翻滚"。
+
 ---
 
 ## 4. 训练与仿真验证：六道门，逐级过
@@ -351,7 +396,7 @@ scripts/dev-push.sh --name duck-c51b    # 有板时：约一分钟上板，走�
 ### 5.3 真机专属确认项（仿真测不到）
 
 - **IMU 冲击饱和**：仿真里冲击是真实物理量；真机上 SM 级跌倒可能把 IMU 打饱和（信号削顶）。必须单独确认。
-- **`limp_fall` 协同**：`robotd` 预测约 0.3 s 后要摔时会提前软化关节。你的策略和它谁先动、会不会互相打架——只在 `robotd --sim` 或真机上能看出来。
+- **`limp_fall` 协同**：`robotd` 预测约 0.3 s 后要摔时会提前软化关节。你的策略和它谁先动、会不会互相打架——只在 `robotd --sim` 或真机上能看出来。机制与参数详见 §3.5，尤其注意 `busy()` 会在 skill 活跃时把摔倒反射关掉。
 - **舵机力矩/热/电流的真实值**：仿真的电流是 `abs(torque) × 100`，注释自己写明 "a fiction with a unit"。
 
 ---
